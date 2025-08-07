@@ -271,6 +271,11 @@ impl SdMmc {
             .unwrap();
         trace!("fifo count: {}", self.fifo_cnt());
     }
+
+    /// Returns the number of blocks.
+    pub fn num_blocks(&self) -> u64 {
+        self.num_blocks
+    }
 }
 
 unsafe impl Send for SdMmc {}
