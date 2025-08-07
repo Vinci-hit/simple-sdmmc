@@ -258,17 +258,20 @@ impl SdMmc {
     }
 
     /// Reads a single block from the SD/MMC card.
-    pub fn read_block(&self, block: u32, buf: &mut [u8; 512]) {
+    pub fn read_block(&mut self, block: u32, buf: &mut [u8; 512]) {
         self.set_transaction_size(512, 512);
         self.send_cmd(Command::ReadSingleBlock(block, buf)).unwrap();
         trace!("fifo count: {}", self.fifo_cnt());
     }
 
     /// Writes a single block to the SD/MMC card.
-    pub fn write_block(&self, block: u32, buf: &[u8; 512]) {
+    pub fn write_block(&mut self, block: u32, buf: &[u8; 512]) {
         self.set_transaction_size(512, 512);
         self.send_cmd(Command::WriteSingleBlock(block, buf))
             .unwrap();
         trace!("fifo count: {}", self.fifo_cnt());
     }
 }
+
+unsafe impl Send for SdMmc {}
+unsafe impl Sync for SdMmc {}
