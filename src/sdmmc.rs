@@ -276,6 +276,9 @@ impl SdMmc {
     pub fn num_blocks(&self) -> u64 {
         self.num_blocks
     }
+
+    /// The size of a block in bytes.
+    pub const BLOCK_SIZE: usize = 512;
 }
 
 unsafe impl Send for SdMmc {}
