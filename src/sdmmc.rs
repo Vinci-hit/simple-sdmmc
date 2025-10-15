@@ -219,17 +219,30 @@ impl SdMmc {
                 debug!("eMMC OCR: {:#x}", ocr);
                 
                 // 获取CID
-                let resp = self.send_cmd(Command::AllSendCid).unwrap();
+                let resp = if let Some(resp) = self.send_cmd(Command::AllSendCid) {
+                    resp
+                } else {
+                    info!("CMD2 (AllSendCid) failed during eMMC initialization.");
+                    return false;
+                };
                 let cid = unsafe { core::mem::transmute::<[u32; 4], Cid>(resp) };
                 info!("eMMC CID: {cid:?}");
 
                 // 设置RCA (对于eMMC，我们可以设置任意值)
                 let rca = 0x0001;
-                self.send_cmd(Command::SetRelativeAddr(rca << 16)).unwrap();
+                if self.send_cmd(Command::SetRelativeAddr(rca << 16)).is_none() {
+                    info!("CMD3 (SetRelativeAddr) failed during eMMC initialization.");
+                    return false;
+                }
                 debug!("eMMC RCA set to: {rca:#x}");
 
                 // 获取CSD
-                let resp = self.send_cmd(Command::SendCsd(rca << 16)).unwrap();
+                let resp = if let Some(resp) = self.send_cmd(Command::SendCsd(rca << 16)) {
+                    resp
+                } else {
+                    info!("CMD9 (SendCsd) failed during eMMC initialization.");
+                    return false;
+                };
                 let csd = unsafe { core::mem::transmute::<[u32; 4], CsdV2>(resp) };
                 debug!("eMMC CSD: {csd:?}");
 
@@ -237,7 +250,10 @@ impl SdMmc {
                 info!("eMMC capacity: {:#x} blocks", self.num_blocks);
 
                 // 选择卡
-                self.send_cmd(Command::SelectCard(rca << 16)).unwrap();
+                if self.send_cmd(Command::SelectCard(rca << 16)).is_none() {
+                    info!("CMD7 (SelectCard) failed during eMMC initialization.");
+                    return false;
+                }
 
                 return true;
             }
@@ -245,14 +261,30 @@ impl SdMmc {
         false
     }
 
-    fn init_sd_card(&mut self) {
+    fn init_sd_card(&mut self) -> bool {
+        let resp = if let Some(resp) = self.send_cmd(Command::SendIfCond(0x1aa)) {
+            resp
+        } else {
+            info!("CMD8 (SendIfCond) failed, assuming unsupported SD card or no SD card present.");
+            return false;
+        };
 
-        let resp = self.send_cmd(Command::SendIfCond(0x1aa)).unwrap();
-        assert_eq!(resp[0] & 0xff, 0xaa, "unsupported version");
+        if resp[0] & 0xff != 0xaa {
+            info!("Unsupported SD card version, resp: {:#x}", resp[0]);
+            return false;
+        }
 
         loop {
-            self.send_cmd(Command::AppCmd(0));
-            let resp = self.send_cmd(Command::SdSendOpCond(0x41FF_8000)).unwrap();
+            if self.send_cmd(Command::AppCmd(0)).is_none() {
+                info!("CMD55 (AppCmd) failed during SD card initialization.");
+                return false;
+            }
+            let resp = if let Some(resp) = self.send_cmd(Command::SdSendOpCond(0x41FF_8000)) {
+                resp
+            } else {
+                info!("ACMD41 (SdSendOpCond) failed during SD card initialization.");
+                return false;
+            };
             let ocr = resp[0];
             if ocr & 0x8000_0000 != 0 {
                 info!("SD card is ready");
@@ -268,28 +300,52 @@ impl SdMmc {
             core::hint::spin_loop();
         }
 
-        let resp = self.send_cmd(Command::AllSendCid).unwrap();
+        let resp = if let Some(resp) = self.send_cmd(Command::AllSendCid) {
+            resp
+        } else {
+            info!("CMD2 (AllSendCid) failed during SD card initialization.");
+            return false;
+        };
         let cid = unsafe { core::mem::transmute::<[u32; 4], Cid>(resp) };
         info!("cid: {cid:?}");
 
-        let resp = self.send_cmd(Command::SendRelativeAddr).unwrap();
+        let resp = if let Some(resp) = self.send_cmd(Command::SendRelativeAddr) {
+            resp
+        } else {
+            info!("CMD3 (SendRelativeAddr) failed during SD card initialization.");
+            return false;
+        };
         let rca = (resp[0] >> 16) & 0xffff;
         debug!("rca: {rca:#x}");
 
-        let resp = self.send_cmd(Command::SendCsd(rca << 16)).unwrap();
+        let resp = if let Some(resp) = self.send_cmd(Command::SendCsd(rca << 16)) {
+            resp
+        } else {
+            info!("CMD9 (SendCsd) failed during SD card initialization.");
+            return false;
+        };
         let csd = unsafe { core::mem::transmute::<[u32; 4], CsdV2>(resp) };
         debug!("csd: {csd:?}");
 
         self.num_blocks = csd.num_blocks();
         info!("SD card capacity: {:#x} blocks", self.num_blocks);
 
-        self.send_cmd(Command::SelectCard(rca << 16)).unwrap();
+        if self.send_cmd(Command::SelectCard(rca << 16)).is_none() {
+            info!("CMD7 (SelectCard) failed during SD card initialization.");
+            return false;
+        }
 
-        self.send_cmd(Command::AppCmd(rca << 16)).unwrap();
+        if self.send_cmd(Command::AppCmd(rca << 16)).is_none() {
+            info!("CMD55 (AppCmd) failed during SD card initialization.");
+            return false;
+        }
 
         self.set_transaction_size(8, 8);
         let mut buf = [0u8; 512];
-        self.send_cmd(Command::SendScr(&mut buf)).unwrap();
+        if self.send_cmd(Command::SendScr(&mut buf)).is_none() {
+            info!("ACMD51 (SendScr) failed during SD card initialization.");
+            return false;
+        }
 
         trace!("fifo count: {}", self.fifo_cnt());
         let resp = unsafe {
@@ -306,6 +362,7 @@ impl SdMmc {
         let rintsts = self.regs.rintsts().read();
         trace!("rintsts: {rintsts:?}");
         self.regs.rintsts().write(rintsts); // clear interrupt status
+        true
     }
 
     fn init_emmc_only(&mut self) {
