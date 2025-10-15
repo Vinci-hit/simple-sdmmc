@@ -189,43 +189,23 @@ impl SdMmc {
         trace!("bmod: {:?}", self.regs.bmod().read());
         trace!("dbaddr: {:?}", self.regs.dbaddr().read());
 
-        // reset clock
-        self.regs.clkena().write(ClkEna::new());
-        self.send_cmd(Command::ResetClock);
-
-        // set clock divider to 400kHz (low)
-        self.regs.clkdiv().write(ClkDiv::new().with_clk_divider0(4));
-
-        // enable clock
-        self.regs.clkena().write(ClkEna::new().with_cclk_enable(1));
-        self.send_cmd(Command::ResetClock);
-
-        trace!("clock reset");
-
-        // set data width -> 1bit
-        self.regs.ctype().write(0.into());
-
-        // reset dma
-        self.regs.bmod().update(|r| r.with_de(false).with_swr(true));
-        self.regs
-            .ctrl()
-            .update(|r| r.with_dma_reset(true).with_use_internal_dmac(false));
-
-        trace!("dma reset");
-
-        trace!("ctrl: {:?}", self.regs.ctrl().read());
-
-        self.send_cmd(Command::GoIdleState);
-        trace!("idle state set");
+        // 基本硬件初始化
+        if !self.basic_hw_init() {
+            info!("Basic hardware initialization failed. Aborting card detection.");
+            return;
+        }
 
         // 尝试检测卡类型
         if self.try_init_emmc() {
             self.card_type = CardType::Emmc;
             info!("eMMC card detected and initialized");
-        } else {
+        } else if self.init_sd_card() {
             self.card_type = CardType::Sd;
-            self.init_sd_card();
             info!("SD card detected and initialized");
+        } else {
+            info!("No card detected or unsupported card type.");
+            // 可以选择在这里进行错误处理或者将 card_type 设置为未知类型
+            // 例如：self.card_type = CardType::Unknown;
         }
     }
 
@@ -332,24 +312,33 @@ impl SdMmc {
         info!("Initializing eMMC driver at {:?}", self.regs);
 
         // 基本的硬件初始化（与SD卡相同）
-        self.basic_hw_init();
+        if !self.basic_hw_init() {
+            info!("Basic hardware initialization failed for eMMC. Aborting eMMC initialization.");
+            return;
+        }
 
         // 直接初始化eMMC
         self.init_emmc_card();
         info!("eMMC driver initialized");
     }
 
-    fn basic_hw_init(&mut self) {
+    fn basic_hw_init(&mut self) -> bool {
         // reset clock
         self.regs.clkena().write(ClkEna::new());
-        self.send_cmd(Command::ResetClock);
+        if self.send_cmd(Command::ResetClock).is_none() {
+            info!("Failed to send ResetClock command during basic hardware initialization.");
+            return false;
+        }
 
         // set clock divider to 400kHz (low)
         self.regs.clkdiv().write(ClkDiv::new().with_clk_divider0(4));
 
         // enable clock
         self.regs.clkena().write(ClkEna::new().with_cclk_enable(1));
-        self.send_cmd(Command::ResetClock);
+        if self.send_cmd(Command::ResetClock).is_none() {
+            info!("Failed to send ResetClock command after enabling clock.");
+            return false;
+        }
 
         trace!("clock reset");
 
@@ -364,8 +353,12 @@ impl SdMmc {
 
         trace!("dma reset");
 
-        self.send_cmd(Command::GoIdleState);
+        if self.send_cmd(Command::GoIdleState).is_none() {
+            info!("Failed to send GoIdleState command during basic hardware initialization.");
+            return false;
+        }
         trace!("idle state set");
+        true
     }
 
     fn init_emmc_card(&mut self) {
