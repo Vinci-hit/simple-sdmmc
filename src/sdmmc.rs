@@ -18,11 +18,16 @@ where
         core::hint::spin_loop();
     }
 }
+enum CardType {  
+    Sd,  
+    Emmc,  
+}  
 
 /// SD/MMC driver.
-pub struct SdMmc {
-    regs: VolatilePtr<'static, RegisterBlock>,
-    num_blocks: u64,
+pub struct SdMmc {  
+    regs: VolatilePtr<'static, RegisterBlock>,  
+    num_blocks: u64,  
+    card_type: CardType,  // 新增字段  
 }
 
 impl SdMmc {
@@ -40,8 +45,27 @@ impl SdMmc {
         let mut this = Self {
             regs,
             num_blocks: 0,
+            card_type: CardType::Sd,
         };
         this.init();
+        this
+    }
+
+    /// Creates a new `SdMmc` instance specifically for eMMC from the given base address.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `base` is a valid pointer to the SD/MMC controller's
+    /// register block and that no other code is concurrently accessing the same hardware.
+    pub unsafe fn new_emmc(base: usize) -> Self {
+        let regs = unsafe { VolatilePtr::new(NonNull::new_unchecked(base as *mut _)) };
+
+        let mut this = Self {
+            regs,
+            num_blocks: 0,
+            card_type: CardType::Emmc,
+        };
+        this.init_emmc_only();
         this
     }
 
@@ -194,6 +218,55 @@ impl SdMmc {
         self.send_cmd(Command::GoIdleState);
         trace!("idle state set");
 
+        // 尝试检测卡类型
+        if self.try_init_emmc() {
+            self.card_type = CardType::Emmc;
+            info!("eMMC card detected and initialized");
+        } else {
+            self.card_type = CardType::Sd;
+            self.init_sd_card();
+            info!("SD card detected and initialized");
+        }
+    }
+
+    fn try_init_emmc(&mut self) -> bool {
+        // 发送CMD1 (SEND_OP_COND) 来检测eMMC
+        // eMMC会响应CMD1，而SD卡不会
+        if let Some(resp) = self.send_cmd(Command::EmmcSendOpCond(0x40FF8000)) {
+            let ocr = resp[0];
+            if ocr & 0x8000_0000 != 0 {
+                // eMMC ready
+                debug!("eMMC OCR: {:#x}", ocr);
+                
+                // 获取CID
+                let resp = self.send_cmd(Command::AllSendCid).unwrap();
+                let cid = unsafe { core::mem::transmute::<[u32; 4], Cid>(resp) };
+                info!("eMMC CID: {cid:?}");
+
+                // 设置RCA (对于eMMC，我们可以设置任意值)
+                let rca = 0x0001;
+                self.send_cmd(Command::SetRelativeAddr(rca << 16)).unwrap();
+                debug!("eMMC RCA set to: {rca:#x}");
+
+                // 获取CSD
+                let resp = self.send_cmd(Command::SendCsd(rca << 16)).unwrap();
+                let csd = unsafe { core::mem::transmute::<[u32; 4], CsdV2>(resp) };
+                debug!("eMMC CSD: {csd:?}");
+
+                self.num_blocks = csd.num_blocks();
+                info!("eMMC capacity: {:#x} blocks", self.num_blocks);
+
+                // 选择卡
+                self.send_cmd(Command::SelectCard(rca << 16)).unwrap();
+
+                return true;
+            }
+        }
+        false
+    }
+
+    fn init_sd_card(&mut self) {
+
         let resp = self.send_cmd(Command::SendIfCond(0x1aa)).unwrap();
         assert_eq!(resp[0] & 0xff, 0xaa, "unsupported version");
 
@@ -253,9 +326,91 @@ impl SdMmc {
         let rintsts = self.regs.rintsts().read();
         trace!("rintsts: {rintsts:?}");
         self.regs.rintsts().write(rintsts); // clear interrupt status
-
-        info!("SD/MMC driver initialized");
     }
+
+    fn init_emmc_only(&mut self) {
+        info!("Initializing eMMC driver at {:?}", self.regs);
+
+        // 基本的硬件初始化（与SD卡相同）
+        self.basic_hw_init();
+
+        // 直接初始化eMMC
+        self.init_emmc_card();
+        info!("eMMC driver initialized");
+    }
+
+    fn basic_hw_init(&mut self) {
+        // reset clock
+        self.regs.clkena().write(ClkEna::new());
+        self.send_cmd(Command::ResetClock);
+
+        // set clock divider to 400kHz (low)
+        self.regs.clkdiv().write(ClkDiv::new().with_clk_divider0(4));
+
+        // enable clock
+        self.regs.clkena().write(ClkEna::new().with_cclk_enable(1));
+        self.send_cmd(Command::ResetClock);
+
+        trace!("clock reset");
+
+        // set data width -> 1bit
+        self.regs.ctype().write(0.into());
+
+        // reset dma
+        self.regs.bmod().update(|r| r.with_de(false).with_swr(true));
+        self.regs
+            .ctrl()
+            .update(|r| r.with_dma_reset(true).with_use_internal_dmac(false));
+
+        trace!("dma reset");
+
+        self.send_cmd(Command::GoIdleState);
+        trace!("idle state set");
+    }
+
+    fn init_emmc_card(&mut self) {
+        // 发送CMD1直到eMMC准备就绪
+        loop {
+            if let Some(resp) = self.send_cmd(Command::EmmcSendOpCond(0x40FF8000)) {
+                let ocr = resp[0];
+                if ocr & 0x8000_0000 != 0 {
+                    info!("eMMC is ready, OCR: {:#x}", ocr);
+                    if ocr & 0x4000_0000 != 0 {
+                        debug!("eMMC supports high capacity");
+                    } else {
+                        debug!("eMMC is standard capacity");
+                    }
+                    break;
+                }
+                trace!("eMMC not ready, ocr: {ocr:x}");
+            }
+            core::hint::spin_loop();
+        }
+
+        // 获取CID
+        let resp = self.send_cmd(Command::AllSendCid).unwrap();
+        let cid = unsafe { core::mem::transmute::<[u32; 4], Cid>(resp) };
+        info!("eMMC CID: {cid:?}");
+
+        // 设置RCA (对于eMMC，我们可以设置任意值)
+        let rca = 0x0001;
+        self.send_cmd(Command::SetRelativeAddr(rca << 16)).unwrap();
+        debug!("eMMC RCA set to: {rca:#x}");
+
+        // 获取CSD
+        let resp = self.send_cmd(Command::SendCsd(rca << 16)).unwrap();
+        let csd = unsafe { core::mem::transmute::<[u32; 4], CsdV2>(resp) };
+        debug!("eMMC CSD: {csd:?}");
+
+        self.num_blocks = csd.num_blocks();
+        info!("eMMC capacity: {:#x} blocks", self.num_blocks);
+
+        // 选择卡
+        self.send_cmd(Command::SelectCard(rca << 16)).unwrap();
+        info!("SD/MMC driver initialized");
+    }   
+
+    
 
     /// Reads a single block from the SD/MMC card.
     pub fn read_block(&mut self, block: u32, buf: &mut [u8; 512]) {
@@ -270,6 +425,14 @@ impl SdMmc {
         self.send_cmd(Command::WriteSingleBlock(block, buf))
             .unwrap();
         trace!("fifo count: {}", self.fifo_cnt());
+    }
+
+    /// Returns the card type (SD or eMMC).
+    pub fn card_type(&self) -> &str {
+        match self.card_type {
+            CardType::Sd => "SD",
+            CardType::Emmc => "eMMC",
+        }
     }
 
     /// Returns the number of blocks.
